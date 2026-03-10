@@ -42,6 +42,16 @@ inline std::shared_ptr<const Var> AsVarLike(const ir::ExprPtr& expr) {
   return nullptr;
 }
 
+/// Validate that a string is a safe MLIR identifier (alphanumeric + underscores).
+/// Prevents injection of arbitrary MLIR via crafted buffer/function names.
+inline void CheckSafeIdentifier(const std::string& value, const std::string& attr_name) {
+  for (char c : value) {
+    CHECK(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+        << attr_name << " contains invalid character '" << c
+        << "'; only alphanumeric and underscore are allowed";
+  }
+}
+
 // ============================================================================
 // Helper Functions for PTO Code Generation
 // ============================================================================
@@ -822,6 +832,303 @@ REGISTER_BACKEND_OP(Backend910B_PTO, "tile.print")
 REGISTER_BACKEND_OP(Backend910B_PTO, "tensor.dim")
     .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
       return MakeTensorDimCodegenPTO(op, codegen);
+    });
+
+// ============================================================================
+// Cross-Core Communication Operations (TPUSH/TPOP)
+// ============================================================================
+
+// system.tpush_to_aiv: Push tile from Cube to Vector
+static std::string MakeTpushToAivCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // Extract tile argument
+  CHECK(op->args_.size() == 1) << "tpush_to_aiv requires 1 argument (tile), got " << op->args_.size();
+  auto tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(tile) << "tpush_to_aiv first argument must be a Var or IterArg";
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tpush_to_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  std::string tile_buf = codegen.GetVarName(tile);
+  std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+
+  // Emit: pto.tpush_to_aiv ins(%tile : tile_type) {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tpush_to_aiv ins(" << tile_buf;
+  if (!tile_type.empty()) {
+    oss << " : " << tile_type;
+  }
+  oss << ") {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.tpush_to_aic: Push tile from Vector to Cube
+static std::string MakeTpushToAicCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // Extract tile argument
+  CHECK(op->args_.size() == 1) << "tpush_to_aic requires 1 argument (tile), got " << op->args_.size();
+  auto tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(tile) << "tpush_to_aic first argument must be a Var or IterArg";
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tpush_to_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  std::string tile_buf = codegen.GetVarName(tile);
+  std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+
+  // Emit: pto.tpush_to_aic ins(%tile : tile_type) {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tpush_to_aic ins(" << tile_buf;
+  if (!tile_type.empty()) {
+    oss << " : " << tile_type;
+  }
+  oss << ") {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.tpop_from_aic: Pop tile from Cube into Vector
+static std::string MakeTpopFromAicCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // tpop has no arguments, it produces a tile result
+  CHECK(op->args_.size() == 0) << "tpop_from_aic takes no arguments, got " << op->args_.size();
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tpop_from_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  std::string result_buf = codegen.GetCurrentResultTarget();
+  INTERNAL_CHECK(!result_buf.empty()) << "tpop_from_aic requires assignment target (tile_buf)";
+  std::string result_type = codegen.GetCurrentResultTileBufTypeString();
+
+  // Emit: %result = pto.tpop_from_aic outs(%result : result_type) {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tpop_from_aic outs(" << result_buf;
+  if (!result_type.empty()) {
+    oss << " : " << result_type;
+  }
+  oss << ") {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.tpop_from_aiv: Pop tile from Vector into Cube
+static std::string MakeTpopFromAivCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // tpop has no arguments, it produces a tile result
+  CHECK(op->args_.size() == 0) << "tpop_from_aiv takes no arguments, got " << op->args_.size();
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tpop_from_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  std::string result_buf = codegen.GetCurrentResultTarget();
+  INTERNAL_CHECK(!result_buf.empty()) << "tpop_from_aiv requires assignment target (tile_buf)";
+  std::string result_type = codegen.GetCurrentResultTileBufTypeString();
+
+  // Emit: %result = pto.tpop_from_aiv outs(%result : result_type) {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tpop_from_aiv outs(" << result_buf;
+  if (!result_type.empty()) {
+    oss << " : " << result_type;
+  }
+  oss << ") {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.tfree_to_aic: Release slot back to Cube producer (called by Vector consumer)
+static std::string MakeTfreeToAicCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // tfree has no arguments
+  CHECK(op->args_.size() == 0) << "tfree_to_aic takes no arguments, got " << op->args_.size();
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tfree_to_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  // Emit: pto.tfree_to_aic {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tfree_to_aic {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.tfree_to_aiv: Release slot back to Vector producer (called by Cube consumer)
+static std::string MakeTfreeToAivCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // tfree has no arguments
+  CHECK(op->args_.size() == 0) << "tfree_to_aiv takes no arguments, got " << op->args_.size();
+
+  // Extract aiv_idx attribute from kwargs
+  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
+  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
+      << "tfree_to_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+
+  // Emit: pto.tfree_to_aiv {aiv_idx = N}
+  std::ostringstream oss;
+  oss << "pto.tfree_to_aiv {aiv_idx = " << aiv_idx << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.aic_initialize_pipe: Initialize cross-core pipe on Cube side
+static std::string MakeAicInitializePipeCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // Extract attributes from kwargs
+  const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
+  const int slot_size = op->GetKwarg<int>("slot_size", -1);
+  const int c2v_consumer_buf = op->GetKwarg<int>("c2v_consumer_buf", -1);  // -1 = not specified
+  const int v2c_consumer_buf = op->GetKwarg<int>("v2c_consumer_buf", -1);
+  CHECK(dir_mask >= 0) << "aic_initialize_pipe requires 'dir_mask' attribute";
+  CHECK(slot_size > 0) << "aic_initialize_pipe requires 'slot_size' attribute";
+
+  std::ostringstream oss;
+  oss << "pto.aic_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size;
+  if (c2v_consumer_buf >= 0) {
+    oss << ", c2v_consumer_buf = " << c2v_consumer_buf;
+  }
+  if (v2c_consumer_buf >= 0) {
+    oss << ", v2c_consumer_buf = " << v2c_consumer_buf;
+  }
+  oss << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+// system.aiv_initialize_pipe: Initialize cross-core pipe on Vector side
+static std::string MakeAivInitializePipeCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+
+  // Extract attributes from kwargs
+  const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
+  const int slot_size = op->GetKwarg<int>("slot_size", -1);
+  const int c2v_consumer_buf = op->GetKwarg<int>("c2v_consumer_buf", -1);  // -1 = not specified
+  const int v2c_consumer_buf = op->GetKwarg<int>("v2c_consumer_buf", -1);
+  CHECK(dir_mask >= 0) << "aiv_initialize_pipe requires 'dir_mask' attribute";
+  CHECK(slot_size > 0) << "aiv_initialize_pipe requires 'slot_size' attribute";
+
+  // Emit: pto.aiv_initialize_pipe {dir_mask = N, slot_size = M, ...}
+  std::ostringstream oss;
+  oss << "pto.aiv_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size;
+  if (c2v_consumer_buf >= 0) {
+    oss << ", c2v_consumer_buf = " << c2v_consumer_buf;
+  }
+  if (v2c_consumer_buf >= 0) {
+    oss << ", v2c_consumer_buf = " << v2c_consumer_buf;
+  }
+  oss << "}";
+  codegen.Emit(oss.str());
+
+  return "";
+}
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tpush_to_aiv")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTpushToAivCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tpop_from_aiv")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTpopFromAivCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tpush_to_aic")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTpushToAicCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tpop_from_aic")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTpopFromAicCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tfree_to_aic")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTfreeToAicCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.tfree_to_aiv")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTfreeToAivCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.aic_initialize_pipe")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeAicInitializePipeCodegenPTO(op, codegen);
+    });
+
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.aiv_initialize_pipe")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeAivInitializePipeCodegenPTO(op, codegen);
+    });
+
+// system.reserve_buffer: Reserve a named cross-core communication buffer
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.reserve_buffer")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+      auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+      CHECK(op->args_.size() == 0) << "reserve_buffer takes no arguments, got " << op->args_.size();
+
+      const auto name = op->GetKwarg<std::string>("name");
+      const int size = op->GetKwarg<int>("size", -1);
+      const int base = op->GetKwarg<int>("base", -1);  // -1 = AUTO
+      CHECK(!name.empty()) << "reserve_buffer requires 'name' attribute";
+      CHECK(size > 0) << "reserve_buffer requires positive 'size' attribute, got " << size;
+      CheckSafeIdentifier(name, "reserve_buffer 'name'");
+
+      std::ostringstream oss;
+      oss << "pto.reserve_buffer {name = \"" << name << "\", size = " << size;
+      if (base >= 0) {
+        oss << ", base = " << base;
+      } else {
+        oss << ", base = auto";
+      }
+      oss << "}";
+      codegen.Emit(oss.str());
+
+      return std::string("");
+    });
+
+// system.import_peer_buffer: Import a peer function's buffer address
+REGISTER_BACKEND_OP(Backend910B_PTO, "system.import_peer_buffer")
+    .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+      auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+      CHECK(op->args_.size() == 0) << "import_peer_buffer takes no arguments, got " << op->args_.size();
+
+      const auto name = op->GetKwarg<std::string>("name");
+      const auto peer_func = op->GetKwarg<std::string>("peer_func");
+      CHECK(!name.empty()) << "import_peer_buffer requires 'name' attribute";
+      CHECK(!peer_func.empty()) << "import_peer_buffer requires 'peer_func' attribute";
+      CheckSafeIdentifier(name, "import_peer_buffer 'name'");
+      CheckSafeIdentifier(peer_func, "import_peer_buffer 'peer_func'");
+
+      std::ostringstream oss;
+      oss << "pto.import_peer_buffer {name = \"" << name << "\", peer_func = \"" << peer_func << "\"}";
+      codegen.Emit(oss.str());
+
+      return std::string("");
     });
 
 REGISTER_BACKEND_OP(Backend910B_PTO, "tile.reshape")

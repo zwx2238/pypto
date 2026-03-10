@@ -69,6 +69,7 @@ class ASTParser:
         gvar_to_func: dict[ir.GlobalVar, ir.Function] | None = None,
         strict_ssa: bool = False,
         closure_vars: dict[str, Any] | None = None,
+        buffer_name_meta: dict[tuple[str, str], dict[str, Any]] | None = None,
     ):
         """Initialize AST parser.
 
@@ -81,6 +82,9 @@ class ASTParser:
             gvar_to_func: Optional map of GlobalVars to parsed Functions for type inference
             strict_ssa: If True, enforce SSA (single assignment). If False (default), allow reassignment.
             closure_vars: Optional variables from the enclosing scope for dynamic shape resolution
+            buffer_name_meta: Optional shared (func_name, buffer_name) → metadata registry for cross-function
+                import_peer_buffer resolution. When multiple functions in a @pl.program share this
+                dict, import_peer_buffer can resolve .base from a peer function's reserve_buffer.
         """
         self.span_tracker = SpanTracker(source_file, source_lines, line_offset, col_offset)
         self.scope_manager = ScopeManager(strict_ssa=strict_ssa)
@@ -112,6 +116,17 @@ class ASTParser:
         # Yield tracking state — None means tracking is inactive (outside loops/ifs)
         self._current_yield_vars: list[str] | None = None
         self._current_yield_types: dict[str, ir.Type] | None = None
+
+        # Buffer metadata registry for reserve_buffer().base attribute access
+        self._buffer_meta: dict[str, dict[str, Any]] = {}
+        # Secondary index:
+        # (func_name, buffer_name) → metadata (for cross-function import_peer_buffer resolution)
+        # Shared across parser instances when parsing a @pl.program with multiple functions.
+        self._buffer_name_meta: dict[tuple[str, str], dict[str, Any]] = (
+            buffer_name_meta if buffer_name_meta is not None else {}
+        )
+        # Current function name (set during parse_function)
+        self._func_name: str = ""
 
     @contextmanager
     def _yield_tracking_scope(self) -> Iterator[None]:
@@ -163,6 +178,7 @@ class ASTParser:
             IR Function object
         """
         func_name = func_def.name
+        self._func_name = func_name
         func_span = self.span_tracker.get_span(func_def)
 
         # Enter function scope
@@ -309,12 +325,19 @@ class ASTParser:
                 resolved = self.type_resolver.resolve_type(ann)
             if resolved is not None and not isinstance(resolved, list):
                 self.type_resolver.validate_annotation_consistency(resolved, value_expr.type, var_name, span)
-                if isinstance(resolved, ir.ShapedType) and resolved.memref is not None:
+                if isinstance(value_expr.type, ir.UnknownType):
+                    # Inferred type is unknown (e.g. tpop_from_aiv): use annotation as type
+                    override_type = resolved
+                elif isinstance(resolved, ir.ShapedType) and resolved.memref is not None:
                     override_type = resolved
         var = self.builder.let(var_name, value_expr, type=override_type, span=span)
 
         # Register in scope
         self.scope_manager.define_var(var_name, var, span=span)
+
+        # Track buffer metadata for attribute access (e.g., pipe_buf.base)
+        if isinstance(stmt.value, ast.Call):
+            self._track_buffer_meta(var_name, stmt.value)
 
     def parse_assignment(self, stmt: ast.Assign) -> None:
         """Parse regular assignment: var = value or tuple unpacking.
@@ -388,6 +411,11 @@ class ASTParser:
                 value_expr = self.parse_expression(stmt.value)
                 var = self.builder.let(var_name, value_expr, span=span)
                 self.scope_manager.define_var(var_name, var, span=span)
+
+                # Track buffer metadata for attribute access (e.g., pipe_buf.base)
+                if isinstance(stmt.value, ast.Call):
+                    self._track_buffer_meta(var_name, stmt.value)
+
                 return
 
         raise ParserSyntaxError(
@@ -1726,14 +1754,59 @@ class ASTParser:
         return self.expr_evaluator.eval_expr(value)
 
     def _resolve_attribute_kwarg(self, value: ast.Attribute) -> Any:
-        """Resolve an Attribute kwarg value (e.g., pl.FP32, config.field)."""
+        """Resolve an Attribute kwarg value (e.g., pl.FP32, config.field, pipe_buf.base)."""
         try:
             return self.type_resolver.resolve_dtype(value)
         except ParserTypeError:
-            # Not a dtype — evaluate as a general expression from closure.
-            # Use eval_expr (not try_eval_expr) so failures surface expression-specific
-            # errors instead of the misleading dtype error from above.
-            return self.expr_evaluator.eval_expr(value)
+            pass
+
+        # Check buffer metadata registry (e.g., pipe_buf.base from reserve_buffer)
+        if isinstance(value.value, ast.Name):
+            meta = self._buffer_meta.get(value.value.id)
+            if meta is not None and value.attr in meta:
+                return meta[value.attr]
+
+        # Not a dtype or buffer attr — evaluate as a general expression from closure.
+        return self.expr_evaluator.eval_expr(value)
+
+    def _track_buffer_meta(self, var_name: str, call: ast.Call) -> None:
+        """Track kwargs from reserve_buffer and import_peer_buffer calls for later attribute access.
+
+        Enables patterns like:
+            pipe_buf = pl.reserve_buffer(..., base=0x1000)
+            pl.aic_initialize_pipe(..., v2c_consumer_buf=pipe_buf.base)
+
+            peer_buf = pl.import_peer_buffer(name="c2v_slot_buffer", peer_func="vector_bidir")
+            pl.aic_initialize_pipe(..., c2v_consumer_buf=peer_buf.base)
+        """
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            return
+        if func.attr not in ("reserve_buffer", "import_peer_buffer"):
+            return
+        meta: dict[str, Any] = {}
+        for kw in call.keywords:
+            if kw.arg is not None and isinstance(kw.value, ast.Constant):
+                meta[kw.arg] = kw.value.value
+        if func.attr == "reserve_buffer":
+            # Index by (func_name, buffer_name) for cross-function import_peer_buffer resolution
+            buf_name = meta.get("name")
+            if buf_name is not None:
+                self._buffer_name_meta[(self._func_name, buf_name)] = meta
+        elif func.attr == "import_peer_buffer":
+            # Resolve base from peer's reserve_buffer if available
+            buf_name = meta.get("name")
+            peer_func_name = meta.get("peer_func")
+            if buf_name is not None and peer_func_name is not None:
+                peer_key = (peer_func_name, buf_name)
+                if peer_key in self._buffer_name_meta:
+                    peer_meta = self._buffer_name_meta[peer_key]
+                    if "base" in peer_meta:
+                        meta["base"] = peer_meta["base"]
+            if "base" not in meta:
+                meta["base"] = -1  # AUTO sentinel
+        if meta:
+            self._buffer_meta[var_name] = meta
 
     def _resolve_list_kwarg(self, value: ast.List) -> Any:
         """Resolve a List kwarg value, trying closure eval first."""
@@ -1873,6 +1946,8 @@ class ASTParser:
         "tpush_to_aic",
         "tpop_from_aic",
         "tpop_from_aiv",
+        "tfree_to_aic",
+        "tfree_to_aiv",
         "aic_initialize_pipe",
         "aiv_initialize_pipe",
         "reserve_buffer",

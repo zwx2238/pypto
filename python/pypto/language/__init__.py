@@ -46,10 +46,15 @@ from .op import system_ops as system
 from .op import tensor_ops as tensor
 from .op import tile_ops as tile
 from .op.system_ops import (
+    AUTO,
+    ImportedBuffer,
+    ReservedBuffer,
     aic_initialize_pipe,
     aiv_initialize_pipe,
     import_peer_buffer,
     reserve_buffer,
+    tfree_to_aic,
+    tfree_to_aiv,
     tpop_from_aic,
     tpop_from_aiv,
     tpush_to_aic,
@@ -267,6 +272,9 @@ __all__ = [
     "sel",
     "sels",
     # Promoted system ops (cross-core)
+    "AUTO",
+    "ImportedBuffer",
+    "ReservedBuffer",
     "tpush_to_aiv",
     "tpush_to_aic",
     "tpop_from_aic",
@@ -275,6 +283,8 @@ __all__ = [
     "aiv_initialize_pipe",
     "reserve_buffer",
     "import_peer_buffer",
+    "tfree_to_aic",
+    "tfree_to_aiv",
     # Promoted tensor-only
     "create_tensor",
     "assemble",
