@@ -62,6 +62,7 @@ void BindPass(nb::module_& m) {
              "TileType memory_space populated in InCore functions")
       .value("BreakContinueValid", IRProperty::BreakContinueValid,
              "Break/continue only in sequential/while loops")
+      .value("UseAfterDef", IRProperty::UseAfterDef, "All variable uses are dominated by a definition")
       .value("StructuredCtrlFlow", IRProperty::StructuredCtrlFlow,
              "No BreakStmt/ContinueStmt — only structured control flow");
 
@@ -224,6 +225,12 @@ void BindPass(nb::module_& m) {
              "Call expression appears in binary expression operands")
       .value("CALL_IN_UNARY_EXPR", nested_call::ErrorType::CALL_IN_UNARY_EXPR,
              "Call expression appears in unary expression operand");
+
+  // Bind UseAfterDefErrorType enum
+  nb::enum_<use_after_def::ErrorType>(passes, "UseAfterDefErrorType",
+                                      "Use-after-def verification error types")
+      .value("USE_BEFORE_DEF", use_after_def::ErrorType::USE_BEFORE_DEF,
+             "Variable used before any definition in scope");
 
   passes.def("split_chunked_loops", &pass::SplitChunkedLoops,
              "Create a pass that splits chunked loops into nested loops");
