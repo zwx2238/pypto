@@ -531,7 +531,7 @@ static inline Tensor make_tensor_2d_dn(
 std::string GenerateConfigFunction(int expected_arg_count) {
   std::ostringstream oss;
   oss << "__attribute__((visibility(\"default\")))\n";
-  oss << "PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {\n";
+  oss << "PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {\n";
   oss << "    (void)orch_args;\n";
   oss << "    return PTO2OrchestrationConfig{\n";
   oss << "        .expected_arg_count = " << expected_arg_count << ",\n";
@@ -562,7 +562,7 @@ std::pair<std::string, std::string> CoreTypeToSubmitParts(CoreType core_type) {
 
 // Removed DataTypeToPTO2Enum — now uses DataTypeToString from dtype.h
 
-// Generate external tensor declaration from OrchArg
+// Generate external tensor declaration from TaskArg
 std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_index,
                                        const TensorTypePtr& tensor_type, const CodegenBase& codegen) {
   std::ostringstream oss;
@@ -580,8 +580,8 @@ std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_ind
         << "orch[" << orch_index << "].data<void>(), " << var_name << "_shapes, " << ndim << ", "
         << codegen.GetRuntimeDataTypeString(tensor_type->dtype_) << ");\n";
   } else {
-    // ND layout: use OrchArg::to_tensor() directly
-    oss << "    Tensor ext_" << var_name << " = orch[" << orch_index << "].to_tensor();\n";
+    // ND layout: convert runtime TaskArg metadata to Tensor directly
+    oss << "    Tensor ext_" << var_name << " = from_task_arg(orch[" << orch_index << "]);\n";
   }
 
   return oss.str();
@@ -1327,7 +1327,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
 
   // 5. Entry function
   oss << "__attribute__((visibility(\"default\")))\n";
-  oss << "void aicpu_orchestration_entry(OrchArg* orch, int arg_count, "
+  oss << "void aicpu_orchestration_entry(TaskArg* orch, int arg_count, "
          "int orch_thread_num, int orch_thread_index) {\n";
   oss << "    (void)arg_count;\n";
   oss << "    (void)orch_thread_num;\n";
@@ -1343,7 +1343,7 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   stmt_codegen.SetAssembleViewInfos(buffer_info.assemble_view_infos);
   stmt_codegen.SetNonOptimizableAssembleRoots(buffer_info.non_optimizable_assemble_roots);
 
-  // 6. External tensors (from OrchArg — all from params)
+  // 6. External tensors (from TaskArg — all from params)
   oss << "    // External tensors\n";
   int orch_idx = 0;
   for (const auto& var : func->params_) {
